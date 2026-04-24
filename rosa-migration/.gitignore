@@ -1,2 +1,3 @@
-artifacts/rosa-migration/migration-log.json
+artifacts/rosa-migration/*.log
+artifacts/rosa-migration/*.json
 artifacts/rosa-migration/migration-report.md

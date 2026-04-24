@@ -1,6 +1,6 @@
 ---
 name: rosa-migration
-description: "Migrate Jira issues from legacy project boards to the ROSAENG project. Guides managers through team selection, board identification, migration mode (lazy vs interactive), sprint preservation, and custom JQL rules."
+description: "Migrate Jira issues from legacy project boards to the ROSAENG project using a hybrid approach: API move (first attempt) with pre-move/UI-move/post-move fallback. Guides managers through team selection, board identification, migration mode, sprint preservation, and custom JQL rules."
 ---
 
 # ROSA Migration Workflow
@@ -10,9 +10,21 @@ Migrate Jira issues from legacy team boards (OCM, SREP, HCMSEC, SLSRE, etc.) int
 ## Context Management
 
 Migrations can involve hundreds of issues. To avoid filling the conversation context window with per-issue output:
-- **Always use `--log-file`** on `--migrate` and `--dry-run` commands. This writes per-issue details to a file while keeping stdout to a compact summary.
+- **Always use `--log-file`** on `--migrate`, `--dry-run`, `--pre-move`, and `--post-move` commands. This writes per-issue details to a file while keeping stdout to a compact summary.
 - **Never read entire log files** into context. Use `head`, `tail`, or `grep` to check specific sections.
 - **Summarize results from the JSON log** (`migration-log.json`) rather than the text output — it's structured and compact.
+
+## Migration Approach Overview
+
+The migration uses a **two-track approach**:
+
+1. **API Move (first attempt)**: The script tries to move issues directly via the Jira REST API. This is the simplest path and works on some projects.
+2. **Hybrid Pre-Move/UI-Move/Post-Move (recommended fallback)**: When the API move silently fails (which happens on most projects including SREP, AAP, HCMSEC), the workflow switches to a three-phase hybrid approach:
+   - **Pre-move**: Script tags issues with a `rosa-migrate-{team}` label and saves a manifest JSON with pre-move field values and target mappings
+   - **UI bulk move**: The user moves the tagged issues through Jira's web UI bulk move wizard (which bypasses the screen restrictions that block the API)
+   - **Post-move**: Script reads the manifest, finds each issue by its old key (Jira redirects), and applies Team field, status transitions, component mappings, and sprint data
+
+Always try the API move first. If it fails silently (returns 204 but the issue stays in the source project), switch to the hybrid approach.
 
 ## Phase 0: Credential Setup
 
@@ -129,9 +141,11 @@ Use `--sprint-records --sprint-labels` to get full sprint records AND labels as 
 ### Option D: None
 Issues are migrated without any sprint data.
 
+**Note on hybrid approach**: When using the hybrid pre-move/UI-move/post-move workflow, sprint records and labels are applied during the `--post-move` phase (Phase 8b). The pre-move manifest captures the sprint data needed to apply them after the UI move completes.
+
 ## Phase 5: Custom JQL Rules
 
-Ask if the manager wants to add custom JQL rules to their ROSAENG board filter. This is optional — the default filter (`project = ROSAENG AND Team = "[ROSA] <team>"`) is usually sufficient.
+Ask if the manager wants to add custom JQL rules to their ROSAENG board filter. This is optional — the default filter (`project = ROSAENG AND Team = "<team-uuid>"`) is usually sufficient.
 
 If they want custom rules:
 
@@ -167,7 +181,7 @@ The decisions JSON format:
 }
 ```
 
-## Phase 7: Dry Run
+## Phase 7: Dry Run and API Move Attempt
 
 **Always run a dry run first.** This is not optional.
 
@@ -185,9 +199,9 @@ python3 .claude/skills/rosa-migration/scripts/migrate.py --migrate --board <boar
 
 After the dry run, read the summary from stdout and share it with the manager. If they want to see specific issues, read targeted sections from the log file (e.g., `head -20` or `grep FAILED`). **Do not read the entire log file into context** — it can be very large. Get explicit approval before proceeding.
 
-## Phase 8: Execute Migration
+### Attempting API Move
 
-After manager approval:
+After manager approval, try the direct API move first:
 
 ```bash
 python3 .claude/skills/rosa-migration/scripts/migrate.py --migrate --board <board_id> --team "<team>" --mode lazy --log-file artifacts/rosa-migration/migration.log
@@ -202,26 +216,100 @@ Add sprint flags based on the manager's Phase 4 choice:
 
 The script processes issues one at a time with rate limiting. It reports progress and any failures.
 
-### If Moves Fail
+### Checking for Silent Failures
 
-If moves fail or return "Silent move failure" errors, run diagnostics on a single issue first:
+After the API move completes, check the log output carefully. If you see "Silent move failure" errors or the summary shows issues that were reported as successful but remain in the source project, the API move is silently failing. This is common — it happens on most source projects (SREP, AAP, HCMSEC, and others).
+
+If the API move works, proceed to Phase 9 (Rename Legacy Board). If it fails, proceed to Phase 8 (Hybrid Migration).
+
+## Phase 8: Hybrid Migration (Pre-Move / UI Move / Post-Move)
+
+This is the recommended fallback when the API move silently fails, which happens on most projects. The Jira Cloud REST API returns 204 but ignores the project change when the `project` field is not on the source project's edit screen.
+
+### Phase 8a: Pre-Move Tagging
+
+Run the pre-move step to tag all target issues and save a manifest:
 
 ```bash
-python3 .claude/skills/rosa-migration/scripts/migrate.py --diagnose --issue <ISSUE_KEY> --team "<team>"
+python3 .claude/skills/rosa-migration/scripts/migrate.py --pre-move --board <board_id> --team "<team>" --mode lazy --log-file artifacts/rosa-migration/pre-move.log
 ```
 
-This checks permissions, issue type compatibility, and field configuration. Common causes:
-- Missing `Move Issues` permission in the source project
-- Issue type doesn't exist in ROSAENG
-- Workflow/field configuration incompatibility between source and target projects
-
-If the move API is fundamentally blocked (e.g., some HCMSEC configurations), use the clone fallback:
+Or with custom JQL:
 
 ```bash
-python3 .claude/skills/rosa-migration/scripts/migrate.py --migrate --board <board_id> --team "<team>" --mode lazy --fallback-clone --log-file artifacts/rosa-migration/migration.log
+python3 .claude/skills/rosa-migration/scripts/migrate.py --pre-move --jql "<jql>" --team "<team>" --mode lazy --log-file artifacts/rosa-migration/pre-move.log
 ```
 
-The `--fallback-clone` flag creates a new issue in ROSAENG with the same fields and links it to the original when a direct move fails. This preserves summary, description, labels, components, assignee, and priority, but does **not** preserve comments, attachments, or history.
+For interactive mode, include `--decisions '<json>'`.
+
+This does two things:
+1. **Tags every issue** with a `rosa-migrate-<team>` label (e.g., `rosa-migrate-aurora`) so they can be found in the Jira UI
+2. **Saves a manifest** JSON file (e.g., `artifacts/rosa-migration/pre-move-manifest-aurora.json`) containing each issue's pre-move field values and target mappings (status, type, components, sprint data)
+
+After pre-move completes, tell the manager how many issues were tagged and confirm the manifest was saved.
+
+### Phase 8b: UI Bulk Move (User Action)
+
+Guide the manager through the Jira UI bulk move. This must be done by the user in their browser — Claude cannot do this step.
+
+Give the manager these instructions:
+
+1. **Open the source project in Jira** — go to `https://redhat.atlassian.net/projects/<SOURCE_PROJECT>/board`
+
+2. **Find the tagged issues** — use this JQL in the issue navigator:
+   ```
+   project = <SOURCE_PROJECT> AND labels = "rosa-migrate-<team>"
+   ```
+   For example: `project = SREP AND labels = "rosa-migrate-aurora"`
+
+3. **Select all issues** — click the checkbox at the top of the list to select all visible issues. If there are more than one page, you may need to do this in batches.
+
+4. **Start bulk change** — click the "..." menu (or "Bulk change") at the top right, then select **"Bulk change all X issues"**
+
+5. **Choose "Move Issues"** — on the Operation step, select **Move Issues** and click Next
+
+6. **Select target project** — choose **ROSAENG** as the target project
+
+7. **Map issue types** — keep the same issue types where possible. If a type does not exist in ROSAENG, map it to **Task**
+
+8. **Map statuses** — Jira will ask for status mappings for each type. Map them as closely as possible to the ROSAENG workflow:
+   - New/Open/To Do -> **New**
+   - In Progress/In Development -> **In-Progress**
+   - Code Review/In Review -> **Review**
+   - Done/Closed/Resolved -> **Closed**
+   - Backlog -> **Backlog**
+   - Refinement/Grooming -> **Refinement**
+
+9. **Confirm and execute** — review the summary and click **Confirm**. Jira will process the moves in the background and send an email when done.
+
+10. **Wait for completion** — the bulk move may take a few minutes for large batches. The user will receive an email from Jira when it finishes.
+
+Tell the manager to let you know when the bulk move is complete so you can proceed with the post-move step.
+
+### Phase 8c: Post-Move Field Application
+
+After the user confirms the UI bulk move is complete, run the post-move step:
+
+```bash
+python3 .claude/skills/rosa-migration/scripts/migrate.py --post-move --team "<team>" --log-file artifacts/rosa-migration/post-move.log
+```
+
+Add sprint flags based on the manager's Phase 4 choice:
+- Sprint records: `--sprint-records` (and optionally `--sprint-count N`)
+- Sprint labels: `--sprint-labels` (and optionally `--sprint-count N`)
+- Both: `--sprint-records --sprint-labels`
+
+**Always use `--log-file`** to keep per-issue output out of the conversation context.
+
+The post-move step reads the manifest and for each issue:
+1. Looks up the issue by its old key (Jira redirects old keys to the new ROSAENG key)
+2. Sets the **Team field** to the correct ROSA team
+3. Applies **status transitions** to match the pre-move status (mapped to ROSAENG workflow)
+4. Sets **component mappings** from the manifest
+5. Applies **sprint data** (records and/or labels, based on flags)
+6. **Removes the migration tag** (`rosa-migrate-<team>` label)
+
+After post-move completes, check the summary for any failures. If individual issues failed, you can re-run post-move — it is idempotent and will skip issues that are already correct.
 
 **After migration completes, generate the migration report** (see Phase 10).
 
@@ -248,6 +336,7 @@ After the migration, create a report at `artifacts/rosa-migration/migration-repo
 **Manager**: <manager name/email>
 **Date**: <date>
 **Migration Mode**: <lazy/interactive>
+**Migration Method**: <API Move / Hybrid (Pre-Move + UI Bulk Move + Post-Move)>
 
 ## Summary
 
@@ -271,6 +360,9 @@ After the migration, create a report at `artifacts/rosa-migration/migration-repo
 - **Board URL**: https://redhat.atlassian.net/jira/software/c/projects/ROSAENG/boards/<rosaeng_board_id>
 
 ## Migration Details
+
+### Migration Method
+<Describe which method was used: API move or hybrid. If hybrid, note that pre-move tagging, UI bulk move, and post-move field application were performed.>
 
 ### Status Mapping Applied
 | Source Status | ROSAENG Status | Count |
@@ -325,6 +417,8 @@ ROSAENG scrum boards support sprints. Two approaches are available:
 - **Sprint records** (`--sprint-records`): Full sprint history is recreated on the ROSAENG board with dates, goals, and issue membership. Closed sprints appear in sprint history/velocity charts.
 - **Sprint labels** (`--sprint-labels`): Lightweight — sprint names are added as issue labels for reference. The manager can create new sprints in ROSAENG and drag issues in manually.
 
+When using the hybrid approach, sprint data is applied during the `--post-move` phase after the UI bulk move is complete.
+
 ### What Moves, What Stays
 - Only issues matching the board filter (or custom JQL) are migrated
 - The original issue key becomes a redirect to the new ROSAENG key
@@ -334,14 +428,36 @@ ROSAENG scrum boards support sprints. Two approaches are available:
 ### Permissions
 The manager needs "Move Issues" permission on both the source project and ROSAENG. If they get permission errors, they should contact aminter.
 
-### Known Issues: HCMSEC Project Moves
-The Jira Cloud REST API may silently fail to move issues from HCMSEC to ROSAENG due to workflow or field configuration differences. The `PUT /rest/api/3/issue/{key}` endpoint returns 204 but doesn't actually change the project, and the bulk move API (`POST /rest/api/3/bulk/issues/move`) returns 500.
+### Team Field and JQL (UUID Requirement)
+The Team field (`customfield_10001`) is a Jira Teams field. In JQL, it must be queried by **team UUID**, not display name. For example:
+- **Correct**: `Team = d82adfd4-85ef-442a-b3f7-1fb533082fdd`
+- **Incorrect**: `Team = "[ROSA] Aurora"` (returns 0 results even if the team exists)
 
-The script now:
-1. Verifies every move actually took effect (detects silent failures)
-2. Uses `overrideScreenSecurity` and `overrideEditableFlag` parameters to bypass field restrictions
+This is a Jira Cloud platform limitation. All ROSAENG board filters use the UUID format. The script's `--update-filter` command handles this automatically using the team mapping. If you ever need to write JQL that filters by Team, always use the UUID from the team mapping, never the display name.
+
+### Known Issues: Silent Move API Failures
+The Jira Cloud REST API silently fails to move issues between projects when the `project` field is not on the source project's edit screen. The `PUT /rest/api/3/issue/{key}` endpoint returns 204 but ignores the project change. The bulk move API (`POST /rest/api/3/bulk/issues/move`) returns 500. This affects SREP, AAP, HCMSEC, and likely most other source projects.
+
+**The recommended approach is the hybrid pre-move/UI-move/post-move workflow** (Phase 8), which bypasses this limitation entirely by using Jira's web UI for the actual move operation.
+
+The script also includes these API-level mitigations (tried automatically before falling back to hybrid):
+1. Verifies every API move actually took effect (detects silent failures)
+2. Tries without override params first, then with `overrideScreenSecurity`/`overrideEditableFlag` as fallback
 3. Tries both API v2 and v3
-4. Offers `--fallback-clone` to create new issues in ROSAENG when moves fail
-5. Provides `--diagnose` to check permissions and configuration before attempting migration
+4. Provides `--diagnose` to check permissions and configuration before attempting migration
 
-If even the clone fallback fails, escalate to a Jira admin to investigate the project configuration.
+If API moves fail, always use the hybrid approach. Do not use clone-based fallbacks.
+
+### Diagnosing Move Failures
+
+If moves fail or return "Silent move failure" errors, run diagnostics on a single issue first:
+
+```bash
+python3 .claude/skills/rosa-migration/scripts/migrate.py --diagnose --issue <ISSUE_KEY> --team "<team>"
+```
+
+This checks permissions, issue type compatibility, and field configuration. Common causes:
+- The `project` field is not on the source project's edit screen (most common — use hybrid approach)
+- Missing `Move Issues` permission in the source project
+- Issue type doesn't exist in ROSAENG
+- Workflow/field configuration incompatibility between source and target projects

@@ -460,58 +460,74 @@ def transition_issue(issue_key, transition_id):
 def move_issue(issue_key, target_project, target_type_name):
     """Move an issue to a different project (and optionally change type).
 
-    Tries API v2 with override parameters first. Verifies the move actually
-    took effect since Jira can return 204 while silently ignoring project changes.
+    Tries without override params first, then with overrides as fallback.
+    Verifies the move actually took effect since Jira can return 204 while
+    silently ignoring project changes.
     """
     body = {"fields": {"project": {"key": target_project}}}
     if target_type_name:
         body["fields"]["issuetype"] = {"name": target_type_name}
 
-    override_params = {
-        "overrideScreenSecurity": "true",
-        "overrideEditableFlag": "true",
-        "notifyUsers": "false",
-    }
+    param_sets = [
+        {"notifyUsers": "false"},
+        {
+            "overrideScreenSecurity": "true",
+            "overrideEditableFlag": "true",
+            "notifyUsers": "false",
+        },
+    ]
 
-    # Try API v2 first (more permissive for cross-project moves)
     for api_version in ["2", "3"]:
-        r = requests.put(
-            f"{JIRA_URL}/rest/api/{api_version}/issue/{issue_key}",
-            params=override_params,
-            json=body, auth=AUTH, headers=HEADERS, timeout=90,
-        )
-        if r.status_code not in (200, 204):
-            if api_version == "3":
-                return False, f"HTTP {r.status_code}: {r.text[:300]}"
-            continue
-
-        # Verify the move actually took effect
-        time.sleep(0.5)
-        verify = get_issue(issue_key)
-        if not verify:
-            return False, f"API v{api_version} returned {r.status_code} but issue not found after move"
-
-        actual_project = verify.get("fields", {}).get("project", {}).get("key", "")
-        if actual_project == target_project:
-            return True, None
-
-        # Silent failure — the PUT succeeded but project didn't change
-        if api_version == "3":
-            return False, (
-                f"Silent move failure: API returned {r.status_code} but issue "
-                f"remained in project {actual_project}. This indicates workflow or "
-                f"field configuration incompatibility between {actual_project} and "
-                f"{target_project}. Verify: (1) issue type '{target_type_name}' exists "
-                f"in {target_project}, (2) user has Move Issues permission in "
-                f"{actual_project}, (3) required fields in {target_project} are satisfied."
+        for params in param_sets:
+            r = requests.put(
+                f"{JIRA_URL}/rest/api/{api_version}/issue/{issue_key}",
+                params=params,
+                json=body, auth=AUTH, headers=HEADERS, timeout=90,
             )
-        # Otherwise try next API version
+            if r.status_code == 403 and "override screen security" in r.text.lower():
+                continue
+            if r.status_code not in (200, 204):
+                if api_version == "3" and params is param_sets[-1]:
+                    return False, f"HTTP {r.status_code}: {r.text[:300]}"
+                continue
+
+            # Verify the move actually took effect
+            time.sleep(0.5)
+            verify = get_issue(issue_key)
+            if not verify:
+                return False, f"API v{api_version} returned {r.status_code} but issue not found after move"
+
+            actual_project = verify.get("fields", {}).get("project", {}).get("key", "")
+            if actual_project == target_project:
+                return True, None
+
+            # Silent failure — try next param set or API version
+            if api_version == "3" and params is param_sets[-1]:
+                return False, (
+                    f"Silent move failure: API returned {r.status_code} but issue "
+                    f"remained in project {actual_project}. This indicates workflow or "
+                    f"field configuration incompatibility between {actual_project} and "
+                    f"{target_project}. Verify: (1) issue type '{target_type_name}' exists "
+                    f"in {target_project}, (2) user has Move Issues permission in "
+                    f"{actual_project}, (3) required fields in {target_project} are satisfied."
+                )
 
     return False, "Move failed on both API v2 and v3"
 
 
 def update_issue_fields(issue_key, fields):
-    """Update fields on an issue."""
+    """Update fields on an issue. Tries without overrides first."""
+    r = requests.put(
+        f"{JIRA_URL}/rest/api/3/issue/{issue_key}",
+        params={"notifyUsers": "false"},
+        json={"fields": fields},
+        auth=AUTH, headers=HEADERS, timeout=60,
+    )
+    if r.status_code in (200, 204):
+        return True, None
+    if r.status_code == 403 and "override screen security" in r.text.lower():
+        return False, r.text[:200]
+    # Retry with overrides for non-403 failures (e.g. field not on screen)
     r = requests.put(
         f"{JIRA_URL}/rest/api/3/issue/{issue_key}",
         params={
@@ -826,6 +842,326 @@ def cmd_diagnose(issue_key, team_name=None):
     for r in results:
         print(f"  {r}")
     print()
+
+
+def cmd_pre_move(board_id=None, jql=None, team_name=None):
+    """Tag issues with a migration label before a manual UI bulk move.
+
+    Saves issue metadata (status, type, components) to a manifest file so
+    post-move can apply the correct mappings even after the project changes.
+    """
+    if team_name not in TEAM_MAP:
+        print(f"Error: Unknown team '{team_name}'. Use --list-teams to see options.")
+        return
+
+    team = TEAM_MAP[team_name]
+    tag = f"rosa-migrate-{team_name.lower().replace('/', '-').replace(' ', '-')}"
+
+    source_jql = jql
+    if board_id and not source_jql:
+        source_jql = get_board_filter_jql(board_id)
+        if not source_jql:
+            print(f"Error: Could not get filter JQL for board {board_id}")
+            return
+    if not source_jql:
+        print("Error: No board or JQL provided")
+        return
+
+    print(f"Pre-move: tagging issues for {team_name}")
+    print(f"Tag label: {tag}")
+    print(f"JQL: {source_jql}\n")
+
+    issues = jira_search(source_jql, fields=[
+        "summary", "status", "issuetype", "components", "labels",
+        TEAM_FIELD, "project", "assignee", "priority",
+    ])
+    print(f"Found {len(issues)} issues")
+
+    to_tag = []
+    skipped = 0
+    for issue in issues:
+        proj = issue["fields"].get("project", {}).get("key", "")
+        if proj == TARGET_PROJECT:
+            skipped += 1
+        else:
+            to_tag.append(issue)
+
+    if skipped:
+        print(f"Skipping {skipped} issues already in ROSAENG")
+
+    if not to_tag:
+        print("No issues to tag.")
+        return
+
+    # Save manifest with pre-move field values
+    manifest = {
+        "team": team_name,
+        "tag": tag,
+        "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "source_board_id": board_id,
+        "source_jql": source_jql,
+        "rosaeng_board_id": team["rosaeng_board_id"],
+        "jira_team_id": team["jira_team_id"],
+        "issues": [],
+    }
+
+    tagged = 0
+    failed_tag = 0
+    for i, issue in enumerate(to_tag):
+        key = issue["key"]
+        fields = issue["fields"]
+        existing_labels = fields.get("labels", [])
+
+        # Save pre-move metadata
+        manifest["issues"].append({
+            "key": key,
+            "summary": fields.get("summary", ""),
+            "source_project": fields.get("project", {}).get("key", ""),
+            "source_status": fields["status"]["name"],
+            "source_type": fields["issuetype"]["name"],
+            "source_components": [c["name"] for c in fields.get("components", [])],
+            "target_type": ISSUE_TYPE_MAP.get(fields["issuetype"]["name"], "Task"),
+            "target_status": STATUS_MAP.get(fields["status"]["name"], "New"),
+        })
+
+        # Add the tag label
+        if tag not in existing_labels:
+            ok, err = update_issue_fields(key, {"labels": existing_labels + [tag]})
+            if ok:
+                tagged += 1
+            else:
+                log_detail(f"  Failed to tag {key}: {err}")
+                failed_tag += 1
+        else:
+            tagged += 1
+
+        if LOG_FILE and (i + 1) % 25 == 0:
+            print(f"  Progress: {i+1}/{len(to_tag)} tagged")
+        time.sleep(0.1)
+
+    # Save manifest
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+    manifest_path = os.path.join(ARTIFACTS_DIR, f"pre-move-manifest-{team_name.lower().replace('/', '-').replace(' ', '-')}.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"\nPre-move complete: {tagged} tagged, {failed_tag} failed")
+    print(f"Manifest saved to: {manifest_path}")
+    print(f"\nNext steps:")
+    print(f"  1. In the Jira UI, search for: labels = {tag}")
+    print(f"  2. Select all issues -> Bulk change -> Move to ROSAENG")
+    print(f"     Choose issue type 'Task' (or appropriate type) for each")
+    print(f"  3. After the move completes, run:")
+    print(f"     python3 scripts/migrate.py --post-move --team \"{team_name}\" --log-file artifacts/rosa-migration/post-move.log")
+
+
+def cmd_post_move(team_name, decisions=None, sprint_labels=False,
+                  sprint_records=False, sprint_board_id=None,
+                  sprint_count=None):
+    """After a UI bulk move, apply Team field, components, status, and sprint data."""
+    if team_name not in TEAM_MAP:
+        print(f"Error: Unknown team '{team_name}'. Use --list-teams to see options.")
+        return
+
+    team = TEAM_MAP[team_name]
+    tag = f"rosa-migrate-{team_name.lower().replace('/', '-').replace(' ', '-')}"
+
+    # Load the pre-move manifest
+    manifest_path = os.path.join(ARTIFACTS_DIR, f"pre-move-manifest-{team_name.lower().replace('/', '-').replace(' ', '-')}.json")
+    if not os.path.exists(manifest_path):
+        print(f"Error: Manifest not found at {manifest_path}")
+        print(f"Run --pre-move first before the UI bulk move.")
+        return
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+
+    print(f"Post-move: applying fields for {team_name}")
+    print(f"Tag label: {tag}")
+    print(f"Manifest: {len(manifest['issues'])} issues from pre-move\n")
+
+    # Look up each manifest issue by old key (Jira redirects to new key)
+    moved_issues = []
+    not_moved = []
+    for m in manifest["issues"]:
+        issue = get_issue(m["key"])
+        if not issue:
+            log_detail(f"  {m['key']}: not found")
+            not_moved.append(m["key"])
+            continue
+        proj = issue["fields"].get("project", {}).get("key", "")
+        if proj == TARGET_PROJECT:
+            moved_issues.append({"issue": issue, "meta": m})
+        else:
+            log_detail(f"  {m['key']}: still in {proj}")
+            not_moved.append(m["key"])
+
+    print(f"Found {len(moved_issues)} issues moved to ROSAENG")
+    if not_moved:
+        print(f"Skipping {len(not_moved)} issues not in ROSAENG: {not_moved[:5]}{'...' if len(not_moved) > 5 else ''}")
+
+    # Parse decisions
+    decision_map = {}
+    if decisions:
+        try:
+            decision_map = json.loads(decisions)
+        except json.JSONDecodeError:
+            print(f"Error: Invalid JSON in --decisions")
+            return
+
+    # Load ROSAENG components
+    rosaeng_comps = get_rosaeng_components()
+
+    # Build sprint data if requested
+    source_sprints = []
+    sprint_issue_map = {}
+    sprint_label_map = {}
+    if (sprint_labels or sprint_records) and sprint_board_id:
+        source_sprints = get_board_sprints(sprint_board_id)
+        if sprint_count:
+            source_sprints = source_sprints[-sprint_count:]
+        for sprint in source_sprints:
+            sprint_issues = get_sprint_issues(sprint_board_id, sprint["id"])
+            sprint_issue_map[sprint["id"]] = sprint_issues
+            if sprint_labels:
+                label = f"sprint:{sprint['name'].replace(' ', '-')}"
+                for key in sprint_issues:
+                    if key not in sprint_label_map:
+                        sprint_label_map[key] = []
+                    sprint_label_map[key].append(label)
+
+    print(f"\n{'='*80}")
+    print(f"APPLYING POST-MOVE FIELDS: {len(moved_issues)} issues")
+    print(f"{'='*80}\n")
+
+    updated = []
+    failed = []
+
+    for i, entry in enumerate(moved_issues):
+        issue = entry["issue"]
+        meta = entry["meta"]
+        new_key = issue["key"]
+        summary = issue["fields"].get("summary", "")
+        current_labels = issue["fields"].get("labels", [])
+        old_key = meta["key"]
+        target_status = meta.get("target_status", "New")
+
+        # Determine target components from manifest
+        target_comps = []
+        for c in meta.get("source_components", []):
+            if c in rosaeng_comps:
+                target_comps.append(c)
+            elif c in decision_map.get("component_map", {}):
+                mapped = decision_map["component_map"][c]
+                if mapped and mapped in rosaeng_comps:
+                    target_comps.append(mapped)
+
+        # Step 1: Set Team field
+        ok, err = update_issue_fields(new_key, {TEAM_FIELD: team["jira_team_id"]})
+        if not ok:
+            log_detail(f"  [{i+1:4d}/{len(moved_issues)}] {new_key:12s} | Failed to set Team: {err}")
+
+        # Step 2: Set components
+        if target_comps:
+            update_issue_fields(new_key, {"components": [{"name": c} for c in target_comps]})
+
+        # Step 3: Add sprint labels
+        extra_labels = sprint_label_map.get(old_key, [])
+        if extra_labels:
+            all_labels = list(set(current_labels + extra_labels))
+            update_issue_fields(new_key, {"labels": all_labels})
+            current_labels = all_labels
+
+        # Step 4: Remove the migration tag label
+        cleaned_labels = [l for l in current_labels if l != tag]
+        if len(cleaned_labels) != len(current_labels):
+            update_issue_fields(new_key, {"labels": cleaned_labels})
+
+        # Step 5: Transition to target status
+        if target_status != "New":
+            transitions = get_transitions(new_key)
+            target_transition = None
+            for t in transitions:
+                if t["to"]["name"] == target_status:
+                    target_transition = t["id"]
+                    break
+            if target_transition:
+                transition_issue(new_key, target_transition)
+
+        log_detail(f"  [{i+1:4d}/{len(moved_issues)}] {new_key:12s} (was {old_key:12s}) | {target_status:12s} | {summary[:50]}")
+        updated.append({"new_key": new_key, "old_key": old_key})
+        time.sleep(0.3)
+
+        if LOG_FILE and (i + 1) % 25 == 0:
+            print(f"  Progress: {i+1}/{len(moved_issues)} ({len(updated)} ok, {len(failed)} failed)")
+
+    # Sprint records (after all issues are updated)
+    sprint_results = []
+    if sprint_records and source_sprints and updated:
+        rosaeng_board = team["rosaeng_board_id"]
+        print(f"\nRecreating {len(source_sprints)} sprint records on ROSAENG board {rosaeng_board}...")
+        key_map = {u["old_key"]: u["new_key"] for u in updated}
+
+        for sprint in source_sprints:
+            src_id = sprint["id"]
+            src_state = sprint.get("state", "future")
+            src_name = sprint["name"]
+            src_issues = sprint_issue_map.get(src_id, [])
+            new_keys = [key_map[k] for k in src_issues if k in key_map]
+
+            new_sprint_id = create_sprint(
+                rosaeng_board, src_name,
+                start_date=sprint.get("startDate"),
+                end_date=sprint.get("endDate"),
+                goal=sprint.get("goal"),
+            )
+            if not new_sprint_id:
+                sprint_results.append({"name": src_name, "status": "create_failed"})
+                continue
+
+            if new_keys:
+                add_issues_to_sprint(new_sprint_id, new_keys)
+            if src_state in ("active", "closed"):
+                update_sprint_state(new_sprint_id, "active")
+            if src_state == "closed":
+                update_sprint_state(new_sprint_id, "closed",
+                                    complete_date=sprint.get("completeDate"))
+
+            sprint_results.append({"name": src_name, "status": "ok",
+                                   "new_sprint_id": new_sprint_id,
+                                   "issues_added": len(new_keys)})
+            time.sleep(0.3)
+
+        ok_sprints = sum(1 for s in sprint_results if s["status"] == "ok")
+        print(f"Sprint records: {ok_sprints}/{len(source_sprints)} created")
+
+    # Summary
+    print(f"\n{'='*80}")
+    print(f"POST-MOVE COMPLETE: {len(updated)} issues updated, {len(failed)} failed")
+    if sprint_results:
+        ok_sprints = sum(1 for s in sprint_results if s["status"] == "ok")
+        print(f"  Sprint records: {ok_sprints}/{len(sprint_results)} created")
+    if LOG_FILE:
+        print(f"\nPer-issue details written to log file.")
+    print()
+
+    # Save log
+    log_data = {
+        "team": team_name,
+        "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "mode": "post-move",
+        "rosaeng_board_id": team["rosaeng_board_id"],
+        "updated_count": len(updated),
+        "failed_count": len(failed),
+        "updated": updated,
+        "failed": failed,
+        "sprint_records": sprint_results if sprint_results else None,
+    }
+    os.makedirs(ARTIFACTS_DIR, exist_ok=True)
+    log_path = os.path.join(ARTIFACTS_DIR, "migration-log.json")
+    with open(log_path, "w") as f:
+        json.dump(log_data, f, indent=2)
+    print(f"Migration log saved to: {log_path}")
 
 
 def cmd_migrate(board_id=None, jql=None, team_name=None, mode="lazy",
@@ -1205,6 +1541,7 @@ def cmd_update_filter(team_name, extra_jql):
 
     team = TEAM_MAP[team_name]
     filter_id = team["rosaeng_filter_id"]
+    team_id = team["jira_team_id"]
 
     # Get current filter
     r = requests.get(
@@ -1219,7 +1556,12 @@ def cmd_update_filter(team_name, extra_jql):
     current_jql = current.get("jql", "")
     print(f"Current filter JQL: {current_jql}")
 
-    new_jql = f"{current_jql} {extra_jql}"
+    # Build base JQL using team UUID (display names don't work in JQL)
+    base_jql = f"project = ROSAENG AND Team = {team_id}"
+    if extra_jql:
+        new_jql = f"{base_jql} {extra_jql} ORDER BY Rank ASC"
+    else:
+        new_jql = f"{base_jql} ORDER BY Rank ASC"
     print(f"New filter JQL:     {new_jql}")
 
     ok = update_filter_jql(filter_id, new_jql)
@@ -1274,6 +1616,10 @@ def main():
                        help="List sprints on a board")
     parser.add_argument("--migrate", action="store_true",
                        help="Migrate issues to ROSAENG")
+    parser.add_argument("--pre-move", action="store_true",
+                       help="Tag issues before a manual UI bulk move")
+    parser.add_argument("--post-move", action="store_true",
+                       help="Apply Team/status/components after a UI bulk move")
     parser.add_argument("--diagnose", action="store_true",
                        help="Diagnose why a move might fail for a specific issue")
     parser.add_argument("--update-filter", action="store_true",
@@ -1328,6 +1674,23 @@ def main():
                 print("Error: --list-sprints requires --board")
                 sys.exit(1)
             cmd_list_sprints(args.board)
+        elif args.pre_move:
+            if not args.team:
+                print("Error: --pre-move requires --team")
+                sys.exit(1)
+            cmd_pre_move(board_id=args.board, jql=args.jql, team_name=args.team)
+        elif args.post_move:
+            if not args.team:
+                print("Error: --post-move requires --team")
+                sys.exit(1)
+            cmd_post_move(
+                team_name=args.team,
+                decisions=args.decisions,
+                sprint_labels=args.sprint_labels,
+                sprint_records=args.sprint_records,
+                sprint_board_id=args.sprint_board,
+                sprint_count=args.sprint_count,
+            )
         elif args.diagnose:
             if not args.issue:
                 print("Error: --diagnose requires --issue (e.g., --issue HCMSEC-123)")

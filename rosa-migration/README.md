@@ -4,12 +4,22 @@ An Ambient workflow that guides ROSA engineering managers through migrating thei
 
 ## What It Does
 
-1. **Sets up credentials** — walks you through creating a Jira API token if you don't have one
-2. **Identifies your team** — shows pre-mapped source boards and ROSAENG destinations
-3. **Discovers issues** — previews what will be migrated with status/type/component breakdowns
-4. **Preserves sprints** — optionally saves sprint names as labels on migrated issues
-5. **Migrates issues** — moves issues to ROSAENG with correct Team field, status, type, and components
-6. **Generates a report** — produces a migration report for the ROSA Project Manager to review
+1. **Sets up credentials** -- walks you through creating a Jira API token if you don't have one
+2. **Identifies your team** -- shows pre-mapped source boards and ROSAENG destinations
+3. **Discovers issues** -- previews what will be migrated with status/type/component breakdowns
+4. **Preserves sprints** -- optionally saves sprint names as labels or full sprint records on migrated issues
+5. **Migrates issues** -- uses a hybrid approach: first tries the Jira API to move issues directly, then falls back to a 3-phase workflow (pre-move tagging, UI bulk move by you in Jira, post-move field application by the script) when the API silently fails
+6. **Generates a report** -- produces a migration report for the ROSA Project Manager to review
+
+## How the Hybrid Migration Works
+
+The Jira REST API silently fails to move issues on most projects (SREP, AAP, HCMSEC, and others). The workflow handles this with a three-phase approach:
+
+1. **Pre-move**: The script tags all your issues with a migration label and saves their current field values to a manifest file
+2. **UI bulk move**: You move the tagged issues through Jira's web UI bulk move wizard (Claude walks you through it step by step). The web UI bypasses the API restrictions.
+3. **Post-move**: The script reads the manifest and applies the correct Team field, status transitions, component mappings, and sprint data to each moved issue
+
+Claude tries the direct API move first -- if it works, great. If it silently fails (which is the common case), Claude guides you through the hybrid approach instead.
 
 ## Supported Teams
 
@@ -36,7 +46,7 @@ An Ambient workflow that guides ROSA engineering managers through migrating thei
 
 - **Jira Cloud access** to `redhat.atlassian.net`
 - **"Move Issues" permission** on both your source project and ROSAENG
-- **A Jira API token** — the workflow will help you create one if needed
+- **A Jira API token** -- the workflow will help you create one if needed
 
 ## Usage
 
@@ -74,7 +84,8 @@ The script scans for conflicts first (unmapped components, types, statuses) and 
 |----------|------|
 | Migration Report | `artifacts/rosa-migration/migration-report.md` |
 | Migration Log | `artifacts/rosa-migration/migration-log.json` |
+| Pre-Move Manifest | `artifacts/rosa-migration/pre-move-manifest-<team>.json` |
 
 ## Questions?
 
-Contact **aminter** (aminter@redhat.com) — ROSA Project Manager.
+Contact **aminter** (aminter@redhat.com) -- ROSA Project Manager.
