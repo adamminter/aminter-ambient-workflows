@@ -44,20 +44,21 @@ An Ambient workflow that guides ROSA engineering managers through migrating thei
 
 Select **"ROSA Jira Project Migration"** from the workflow list, or load as a Custom Workflow:
 
-- **URL**: `https://github.com/<org>/rosa-migration-workflow.git`
+- **URL**: `https://github.com/adamminter/aminter-ambient-workflows.git`
 - **Branch**: `main`
-- **Path**: `.`
+- **Path**: `rosa-migration`
 
-### In Claude Code
+### In Claude Code (local)
 
-From the workflow directory:
+If you received this as a zip file or cloned the repo, run Claude Code from the workflow directory:
 
-```
-cd rosa-migration-workflow
+```bash
+unzip rosa-migration.zip   # if using the zip distribution
+cd rosa-migration
 claude
 ```
 
-Then tell Claude which team you want to migrate.
+Claude will automatically load the workflow configuration and guide you through the migration. Just tell it which team you want to migrate.
 
 ## Migration Modes
 
